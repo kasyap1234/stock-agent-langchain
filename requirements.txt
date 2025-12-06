@@ -1,0 +1,10 @@
+langchain[google-genai]
+langchain-groq
+langgraph
+yfinance
+pandas
+ta
+duckduckgo-search
+ddgs
+python-dotenv
+structlog
