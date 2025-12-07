@@ -54,44 +54,25 @@ def agent_node_with_error_handling(state, agent, name):
         error_msg = f"Error in {name}: {str(e)}\nReturning partial analysis."
         return {"messages": [HumanMessage(content=error_msg, name=name)]}
 
-async def parallel_analysts_node(state: AgentState) -> Dict:
+def run_analysts_sequential(state: AgentState) -> Dict:
     """
-    Run Technical, Fundamental, and Sentiment analysts in parallel for 3x speedup.
-    
-    This is the key optimization - instead of sequential execution,
-    all three analysts run simultaneously.
+    Run Technical, Fundamental, and Sentiment analysts sequentially to reduce
+    concurrent LLM calls (helps avoid Groq 429 rate limits).
     """
     try:
-        # Run all three analysts concurrently
-        tasks = [
-            asyncio.create_task(asyncio.to_thread(
-                agent_node_with_error_handling, state, tech_agent, "Technical_Analyst"
-            )),
-            asyncio.create_task(asyncio.to_thread(
-                agent_node_with_error_handling, state, fund_agent, "Fundamental_Analyst"
-            )),
-            asyncio.create_task(asyncio.to_thread(
-                agent_node_with_error_handling, state, sent_agent, "Sentiment_Analyst"
-            ))
+        agents = [
+            (tech_agent, "Technical_Analyst"),
+            (fund_agent, "Fundamental_Analyst"),
+            (sent_agent, "Sentiment_Analyst"),
         ]
-        
-        # Wait for all to complete
-        results = await asyncio.gather(*tasks)
-        
-        # Combine all messages
         all_messages = []
-        for result in results:
+        for agent, name in agents:
+            result = agent_node_with_error_handling(state, agent, name)
             all_messages.extend(result["messages"])
-        
         return {"messages": all_messages}
-        
     except Exception as e:
-        error_msg = f"Error in parallel analysts: {str(e)}"
-        return {"messages": [HumanMessage(content=error_msg, name="ParallelAnalysts")]}
-
-def sync_parallel_analysts(state: AgentState) -> Dict:
-    """Sync wrapper for parallel analysts."""
-    return asyncio.run(parallel_analysts_node(state))
+        error_msg = f"Error in analysts: {str(e)}"
+        return {"messages": [HumanMessage(content=error_msg, name="Analysts")]}
 
 # Create Graph
 workflow = StateGraph(AgentState)
@@ -99,7 +80,7 @@ workflow = StateGraph(AgentState)
 # Add Nodes
 workflow.add_node("ContextSetup", setup_analysis_context) # NEW
 workflow.add_node("Planner", functools.partial(agent_node_with_error_handling, agent=planner_agent, name="Planner"))
-workflow.add_node("ParallelAnalysts", sync_parallel_analysts)  # NEW: Parallel execution
+workflow.add_node("ParallelAnalysts", run_analysts_sequential)  # lowered concurrency
 workflow.add_node("Ensemble", functools.partial(agent_node_with_error_handling, agent=ensemble_agent, name="Ensemble"))
 workflow.add_node("Critic", functools.partial(agent_node_with_error_handling, agent=critic_agent, name="Critic"))
 workflow.add_node("FinalSynthesis", synthesize_final_call)

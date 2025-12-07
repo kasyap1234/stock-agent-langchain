@@ -1,10 +1,8 @@
 """
 Optimized main entry point with parallel execution and streaming.
 """
-from dotenv import load_dotenv
-load_dotenv()
-
-from src.graph.workflow import app
+from dotenv import load_dotenv, find_dotenv, dotenv_values
+from pathlib import Path
 from langchain_core.messages import HumanMessage
 import argparse
 import os
@@ -13,11 +11,43 @@ import time
 
 warnings.filterwarnings("ignore", message=".*Pydantic V1.*")
 
+def load_env():
+    """
+    Load environment variables from common locations.
+    Tries project root, current working directory, then nearest .env via find_dotenv.
+    """
+    candidates = [
+        Path(__file__).resolve().parent / ".env",  # project root (where main.py lives)
+        Path.cwd() / ".env",                       # current working directory
+    ]
+    for path in candidates:
+        load_dotenv(path, override=False)
+        # Fallback: directly parse and inject if still missing
+        if not os.getenv("GROQ_API_KEY") and path.exists():
+            vals = dotenv_values(path)
+            if vals.get("GROQ_API_KEY"):
+                os.environ.setdefault("GROQ_API_KEY", vals["GROQ_API_KEY"])
+
+    # Fallback: nearest .env upwards from cwd
+    found = find_dotenv(usecwd=True)
+    if found:
+        load_dotenv(found, override=False)
+        if not os.getenv("GROQ_API_KEY"):
+            vals = dotenv_values(found)
+            if vals.get("GROQ_API_KEY"):
+                os.environ.setdefault("GROQ_API_KEY", vals["GROQ_API_KEY"])
+
+
 def main():
+    load_env()
+
     if not os.getenv("GROQ_API_KEY"):
         print("Error: GROQ_API_KEY not found!")
         print("\nSet it with: export GROQ_API_KEY=your_key_here")
         return
+
+    # Import after key check so ChatGroq isn't instantiated without credentials
+    from src.graph.workflow import app
 
     parser = argparse.ArgumentParser(description="Optimized Swing Trade Bot")
     parser.add_argument("ticker", type=str, help="Stock Ticker (e.g., RELIANCE.NS)")

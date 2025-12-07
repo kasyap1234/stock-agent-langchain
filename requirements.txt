@@ -1,6 +1,7 @@
 langchain[google-genai]
 langchain-groq
 langgraph
+langchain-community
 yfinance
 pandas
 ta

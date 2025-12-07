@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Dict, List
 from langchain.tools import tool
 
-# Memory file location
-MEMORY_DIR = Path("/home/tgt/Documents/projects/personal/stock-agent-langchain/.memory")
-MEMORY_DIR.mkdir(exist_ok=True)
+# Memory file location (default to project root .memory, overridable via env)
+DEFAULT_MEMORY_DIR = Path(__file__).resolve().parents[2] / ".memory"
+MEMORY_DIR = Path(os.getenv("MEMORY_DIR", DEFAULT_MEMORY_DIR))
+MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 PREDICTIONS_FILE = MEMORY_DIR / "predictions.json"
 
 
