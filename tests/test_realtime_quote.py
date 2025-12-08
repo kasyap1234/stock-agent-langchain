@@ -41,7 +41,7 @@ def test_get_realtime_quote_caches_and_formats(monkeypatch):
 
     assert "123.45" in result_1
     assert "as of" in result_1
-    assert "DATA:" in result_1
+    assert "JSON:" in result_1
     # Cache should avoid a second Ticker instantiation
     assert call_count["calls"] == 1
 

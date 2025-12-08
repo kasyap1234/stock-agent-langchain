@@ -2,7 +2,7 @@
 Multi-strategy ensemble that runs multiple analysis approaches and votes.
 Enhanced with regime-aware dynamic weighting.
 """
-from langchain_groq import ChatGroq
+from src.utils.llm_fallbacks import groq_with_cerebras_fallback
 from langgraph.prebuilt import create_react_agent
 from langchain.tools import tool
 import yfinance as yf
@@ -11,7 +11,7 @@ import time
 from src.utils.logging_config import AgentLogger
 from src.middleware.retry_handler import retry_yfinance
 
-llm = ChatGroq(model="qwen/qwen3-32b", temperature=0, max_retries=5)
+llm = groq_with_cerebras_fallback(model="qwen/qwen3-32b", temperature=0, max_retries=5)
 logger = AgentLogger("ensemble")
 
 @tool

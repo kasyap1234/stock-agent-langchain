@@ -43,6 +43,8 @@ def _extract_fast_info(stock: Any) -> Dict[str, Any]:
         if val:
             currency = val
             break
+    if isinstance(currency, str):
+        currency = currency.upper()
 
     prev_close = _get_attr_or_item(fast_info, "previous_close") or _get_attr_or_item(fast_info, "previousClose")
 
@@ -122,9 +124,19 @@ def fetch_realtime_quote_structured(ticker: str) -> Dict[str, Any]:
                 stale = True
                 stale_reason = stale_reason or f"Daily history unavailable: {e}"
 
+        if price is None:
+            stale = True
+            stale_reason = stale_reason or "Price unavailable from data source"
+        else:
+            price = float(price)
+
         as_of = (
             last_ts.isoformat() if last_ts else datetime.now(timezone.utc).isoformat()
         )
+
+        currency = (currency or "N/A")
+        if isinstance(currency, str):
+            currency = currency.upper()
 
         quote = {
             "ticker": ticker,
@@ -193,12 +205,19 @@ def get_realtime_quote(ticker: str) -> str:
     freshness = "STALE" if stale else "FRESH"
     freshness_detail = f"Reason: {stale_reason}" if stale_reason else ""
 
-    summary = (
-        f"Live quote for {ticker}: {price} {currency} as of {as_of} "
-        f"({freshness}). {freshness_detail}".strip()
-    )
+    if price is None:
+        summary = (
+            f"Live quote for {ticker}: Price unavailable—do not fabricate price or levels. "
+            f"{freshness_detail}".strip()
+        )
+    else:
+        summary = (
+            f"Live quote for {ticker}: {price} {currency} as of {as_of} "
+            f"({freshness}). {freshness_detail}".strip()
+        )
 
-    return summary + f"\nDATA: {json.dumps(data, default=str)}"
+    # Make the JSON payload easy to parse downstream
+    return summary + f"\nJSON:{json.dumps(data, default=str)}"
 
 # Lightweight in-memory cache to reduce repeat yfinance calls for quotes
 _quote_cache: Dict[str, Dict[str, Any]] = {}
@@ -310,12 +329,27 @@ def calculate_indicators(ticker: str, period: str = "1y") -> str:
         df['bb_high'] = bb.bollinger_hband()
         df['bb_low'] = bb.bollinger_lband()
 
+        # Average True Range (volatility) and volume trend
+        atr_indicator = ta.volatility.AverageTrueRange(
+            high=df["High"], low=df["Low"], close=df["Close"], window=14
+        )
+        df["atr_14"] = atr_indicator.average_true_range()
+        df["vol_avg_20"] = df["Volume"].rolling(20).mean()
+
         # Get latest values
         latest = df.iloc[-1]
+        atr_14 = latest["atr_14"]
+        vol_avg_20 = latest["vol_avg_20"]
+        vol_ratio = (latest["Volume"] / vol_avg_20) if vol_avg_20 and vol_avg_20 > 0 else None
 
         # Log successful calculation
         latency_ms = (time.time() - start_time) * 1000
         logger.log_fetch(ticker, "indicators", True, latency_ms, len(df))
+
+        if vol_ratio is not None:
+            volume_line = f"Volume vs 20d avg: {vol_ratio:.2f}x (Current: {latest['Volume']:.0f}, 20d avg: {vol_avg_20:.0f})"
+        else:
+            volume_line = f"Volume: {latest['Volume']:.0f} (20d avg unavailable)"
 
         report = f"""
 Technical Indicators for {ticker} (Date: {latest.name.date()}):
@@ -328,6 +362,8 @@ EMA 20: {latest['ema_20']:.2f}
 EMA 50: {latest['ema_50']:.2f}
 EMA 200: {latest['ema_200']:.2f}
 Bollinger Bands: High {latest['bb_high']:.2f}, Low {latest['bb_low']:.2f}
+ATR (14): {atr_14:.2f}
+{volume_line}
 """
         return report
 

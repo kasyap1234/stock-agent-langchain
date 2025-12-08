@@ -7,9 +7,28 @@ from langchain_core.messages import HumanMessage
 import argparse
 import os
 import warnings
+import importlib
 import time
 
+# Suppress noisy warnings (we still log critical errors)
 warnings.filterwarnings("ignore", message=".*Pydantic V1.*")
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*end of life.*")
+try:
+    from urllib3.exceptions import NotOpenSSLWarning
+
+    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
+except Exception:
+    pass
+
+# Patch importlib.metadata for Python 3.9 environments lacking packages_distributions
+try:
+    import importlib.metadata as importlib_metadata  # type: ignore
+    if not hasattr(importlib_metadata, "packages_distributions"):
+        import importlib_metadata as backport
+
+        importlib_metadata.packages_distributions = backport.packages_distributions  # type: ignore
+except Exception:
+    pass
 
 def load_env():
     """

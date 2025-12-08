@@ -1,7 +1,8 @@
 """
 Reflection/Critic Agent that reviews and validates other agents' analyses.
 """
-from langchain_groq import ChatGroq
+from src.utils.llm_fallbacks import groq_with_cerebras_fallback
+import os
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.prebuilt import create_react_agent
 from src.tools.backtesting import backtest_trade_call
@@ -13,17 +14,18 @@ import os
 
 # Initialize LLM for critic - test Gemini availability and fall back to Groq if needed
 llm = None
-try:
-    # Try Gemini first as the primary LLM
-    gemini_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0.3)
-    # Test if Gemini actually works by making a quick API call
-    test_response = gemini_llm.invoke("Hello")
-    print(f"Critic initialized with Gemini: {type(gemini_llm)}")
-    llm = gemini_llm
-except Exception as e:
-    print(f"Warning: Gemini API failed test call, falling back to Groq/OpenAI: {e}")
-    # Fallback to Groq with OpenAI model
-    llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, max_retries=5)
+gemini_key = os.getenv("GOOGLE_API_KEY")
+if gemini_key:
+    try:
+        # Try Gemini only if key exists
+        gemini_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0.3)
+        llm = gemini_llm
+    except Exception as e:
+        print(f"Warning: Gemini init failed, using Groq/Cerebras fallback: {e}")
+
+# Fallback to Groq/Cerebras if Gemini not set or failed
+if llm is None:
+    llm = groq_with_cerebras_fallback(model="openai/gpt-oss-120b", temperature=0.3, max_retries=5)
 
 @tool
 def calculate_advanced_confidence(analysis_json: str) -> str:
@@ -87,6 +89,13 @@ Be skeptical but constructive. Your goal is to improve accuracy, not to be negat
 
 Key areas to critique:
 - Are technical levels realistic given recent price action?
+- Did the analysts anchor to the parsed live price JSON from get_realtime_quote?
+- If price was unavailable, did they explicitly avoid numeric targets/stops?
+- If the quote was marked STALE, did they clearly flag it and lower conviction?
+- Technical depth: Did they include volume confirmation (vs 20d avg) and ATR-based sizing? Reject breakouts without volume/ATR context.
+- Fundamental depth: Did they cover valuation sanity (PE/FwdPE/EV-EBITDA/PB/PS), cash conversion (OCF/NI), accruals, leverage (Debt/EBITDA), and cash/debt coverage?
+- Sentiment quality: Are there at least two recent sources with recency noted? If not, mark sentiment as insufficient.
+- Risk: If conviction is low or data stale, did they suggest position sizing or stand-aside guidance?
 - Do fundamentals truly support the bias?
 - Is sentiment analysis based on reliable sources?
 - What could go wrong with this trade?

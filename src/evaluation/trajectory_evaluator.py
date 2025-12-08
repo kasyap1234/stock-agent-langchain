@@ -1,7 +1,7 @@
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-from langchain_groq import ChatGroq
+from src.utils.llm_fallbacks import groq_with_cerebras_fallback
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
@@ -28,7 +28,8 @@ def strip_thinking_tags(text: str) -> str:
 
 class TrajectoryEvaluator:
     def __init__(self, model_name: str = "qwen/qwen3-32b"):
-        self.llm = ChatGroq(model=model_name, temperature=0, max_retries=5)
+        # groq_with_cerebras_fallback implements __ror__/__or__ for LCEL
+        self.llm = groq_with_cerebras_fallback(model=model_name, temperature=0, max_retries=5)
         self.parser = JsonOutputParser(pydantic_object=EvaluationResult)
         
     def evaluate_trajectory(self, messages: List[BaseMessage], agent_name: str) -> TrajectoryScore:
@@ -47,6 +48,8 @@ class TrajectoryEvaluator:
             criteria = (
                 "- Did the agent use 'multi_timeframe_analysis'? (CRITICAL)\n"
                 "- Did it check Weekly, Daily, and 4H timeframes?\n"
+                "- Did it anchor levels to the parsed live price JSON and avoid numeric levels when price was unavailable?\n"
+                "- Did it cite volume vs 20d avg and ATR(14), and avoid breakout calls without volume/ATR confirmation?\n"
                 "- Is the entry/exit logic consistent with the analysis?\n"
                 "- Did it provide specific price levels?"
             )
@@ -54,12 +57,15 @@ class TrajectoryEvaluator:
             criteria = (
                 "- Did the agent check for upcoming earnings?\n"
                 "- Did it identify major recent news?\n"
-                "- Did it avoid relying solely on old data?"
+                "- Did it avoid relying solely on old data?\n"
+                "- Did it correctly handle live price: cite parsed price/as_of if present, or say 'price unavailable' without inventing levels?\n"
+                "- Did it cover valuation sanity (PE/FwdPE/EV-EBITDA/PB/PS), earnings quality (OCF/NI, accruals), leverage & coverage (Debt/EBITDA, OCF/FCF vs debt), and liquidity?"
             )
         elif "Sentiment" in agent_name:
             criteria = (
                 "- Did the agent cite specific sources or recent articles?\n"
-                "- Is the sentiment classification supported by evidence?"
+                "- Is the sentiment classification supported by evidence?\n"
+                "- Are there at least two distinct recent sources (<14 days)? If not, did it say 'insufficient evidence' instead of guessing?"
             )
         else:
             criteria = (

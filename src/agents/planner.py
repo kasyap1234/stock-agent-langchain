@@ -1,12 +1,12 @@
 """
 Planner Agent that creates custom analysis strategies based on stock characteristics.
 """
-from langchain_groq import ChatGroq
+from src.utils.llm_fallbacks import groq_with_cerebras_fallback
 from langgraph.prebuilt import create_react_agent
 from langchain.tools import tool
 import yfinance as yf
 
-llm = ChatGroq(model="moonshotai/kimi-k2-instruct-0905", temperature=0.2, max_retries=5)
+llm = groq_with_cerebras_fallback(model="moonshotai/kimi-k2-instruct-0905", temperature=0.2, max_retries=5)
 
 @tool
 def analyze_stock_characteristics(ticker: str) -> str:
