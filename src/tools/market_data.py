@@ -2,6 +2,9 @@ import yfinance as yf
 import pandas as pd
 import ta
 import time
+import json
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 from langchain.tools import tool
 from src.utils.logging_config import ToolLogger
 from src.validation.data_validators import MarketDataValidator, ValidationError
@@ -10,6 +13,196 @@ from src.middleware.retry_handler import retry_yfinance
 # Initialize logger and validator
 logger = ToolLogger("market_data")
 validator = MarketDataValidator()
+
+
+def _get_attr_or_item(obj: Any, key: str) -> Optional[Any]:
+    """Safely extract value from mapping or object attribute."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _extract_fast_info(stock: Any) -> Dict[str, Any]:
+    """Extract price/currency from yfinance fast_info if available."""
+    fast_info = _get_attr_or_item(stock, "fast_info")
+    price_keys = ["last_price", "lastPrice", "regularMarketPrice"]
+    currency_keys = ["currency", "currencyCode"]
+
+    price = None
+    for key in price_keys:
+        val = _get_attr_or_item(fast_info, key)
+        if val is not None:
+            price = float(val)
+            break
+
+    currency = None
+    for key in currency_keys:
+        val = _get_attr_or_item(fast_info, key)
+        if val:
+            currency = val
+            break
+
+    prev_close = _get_attr_or_item(fast_info, "previous_close") or _get_attr_or_item(fast_info, "previousClose")
+
+    return {
+        "price": price,
+        "currency": currency,
+        "previous_close": prev_close,
+    }
+
+
+def fetch_realtime_quote_structured(ticker: str) -> Dict[str, Any]:
+    """
+    Fetch a near real-time quote for a ticker with freshness validation and caching.
+
+    Returns structured data:
+    {
+        "ticker": str,
+        "price": float | None,
+        "currency": str | None,
+        "previous_close": float | None,
+        "as_of": iso timestamp str,
+        "stale": bool,
+        "stale_reason": str | None,
+        "source": "yfinance"
+    }
+    """
+    now = time.time()
+    cached = _quote_cache.get(ticker)
+    if cached and (now - cached["fetched_at"]) < _QUOTE_CACHE_TTL_SECONDS:
+        return cached["data"]
+
+    start_time = time.time()
+    try:
+        stock = yf.Ticker(ticker)
+        fast_bits = _extract_fast_info(stock)
+
+        # Try to get 1-minute data for freshness
+        intraday_df = pd.DataFrame()
+        try:
+            intraday_df = stock.history(period="1d", interval="1m")
+        except Exception:
+            intraday_df = pd.DataFrame()
+
+        last_ts = None
+        hist_price = None
+        if intraday_df is not None and not intraday_df.empty:
+            last_row = intraday_df.tail(1)
+            hist_price = float(last_row["Close"].iloc[0])
+            last_ts = pd.to_datetime(last_row.index[-1]).tz_localize(None)
+
+        price = fast_bits["price"] or hist_price
+        currency = fast_bits["currency"]
+        previous_close = fast_bits["previous_close"]
+
+        stale = False
+        stale_reason = None
+
+        if intraday_df is not None and not intraday_df.empty:
+            valid, reason = validator.validate_timestamp_freshness(ticker, intraday_df, max_age_days=2)
+            stale = not valid
+            stale_reason = reason
+        else:
+            stale = True
+            stale_reason = "No intraday data returned"
+
+        # If we still have no price, try daily history as last resort
+        if price is None:
+            try:
+                daily_df = stock.history(period="5d")
+                if not daily_df.empty:
+                    price = float(daily_df["Close"].iloc[-1])
+                    last_ts = pd.to_datetime(daily_df.index[-1]).tz_localize(None)
+                    valid, reason = validator.validate_timestamp_freshness(ticker, daily_df, max_age_days=5)
+                    stale = not valid
+                    stale_reason = reason
+            except Exception as e:
+                stale = True
+                stale_reason = stale_reason or f"Daily history unavailable: {e}"
+
+        as_of = (
+            last_ts.isoformat() if last_ts else datetime.now(timezone.utc).isoformat()
+        )
+
+        quote = {
+            "ticker": ticker,
+            "price": float(price) if price is not None else None,
+            "currency": currency or "N/A",
+            "previous_close": float(previous_close) if previous_close is not None else None,
+            "as_of": as_of,
+            "stale": bool(stale),
+            "stale_reason": stale_reason,
+            "source": "yfinance",
+        }
+
+        latency_ms = (time.time() - start_time) * 1000
+        logger.log_fetch(
+            ticker=ticker,
+            data_type="realtime_quote",
+            success=price is not None,
+            latency_ms=latency_ms,
+            records_fetched=len(intraday_df) if intraday_df is not None else 0,
+            error=stale_reason if price is None else None,
+        )
+
+        _quote_cache[ticker] = {"fetched_at": now, "data": quote}
+        return quote
+    except Exception as e:
+        latency_ms = (time.time() - start_time) * 1000
+        logger.log_fetch(
+            ticker=ticker,
+            data_type="realtime_quote",
+            success=False,
+            latency_ms=latency_ms,
+            records_fetched=0,
+            error=str(e),
+        )
+        return {
+            "ticker": ticker,
+            "price": None,
+            "currency": "N/A",
+            "previous_close": None,
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "stale": True,
+            "stale_reason": str(e),
+            "source": "yfinance",
+            "error": str(e),
+        }
+
+
+@tool
+def get_realtime_quote(ticker: str) -> str:
+    """
+    Fetches a near real-time quote with validation and caching.
+
+    Returns a human summary plus JSON payload for downstream agents.
+    """
+    data = fetch_realtime_quote_structured(ticker)
+
+    if data.get("error"):
+        return f"Live quote unavailable for {ticker}: {data['error']}"
+
+    price = data.get("price")
+    currency = data.get("currency") or "N/A"
+    stale = data.get("stale")
+    stale_reason = data.get("stale_reason")
+    as_of = data.get("as_of")
+
+    freshness = "STALE" if stale else "FRESH"
+    freshness_detail = f"Reason: {stale_reason}" if stale_reason else ""
+
+    summary = (
+        f"Live quote for {ticker}: {price} {currency} as of {as_of} "
+        f"({freshness}). {freshness_detail}".strip()
+    )
+
+    return summary + f"\nDATA: {json.dumps(data, default=str)}"
+
+# Lightweight in-memory cache to reduce repeat yfinance calls for quotes
+_quote_cache: Dict[str, Dict[str, Any]] = {}
+_QUOTE_CACHE_TTL_SECONDS = 45
 
 @tool
 def get_stock_history(ticker: str, period: str = "1y") -> str:

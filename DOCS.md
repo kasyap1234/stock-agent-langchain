@@ -17,21 +17,21 @@
 ## Onboarding Guide
 1) Prereqs: Python 3.10+ with `uv` or `pip`, `GROQ_API_KEY` (required), optional `GOOGLE_API_KEY`, `ALPHA_VANTAGE_KEY`, `FINNHUB_API_KEY`.
 2) Setup:
-   - `python -m venv .venv && source .venv/bin/activate`
-   - `uv pip install -r requirements.txt` (or `pip install -r requirements.txt`)
-   - Create `.env` with keys (see `README.md`).
+- `python -m venv .venv && source .venv/bin/activate`
+- `uv pip install -r requirements.txt` (or `pip install -r requirements.txt`)
+- Create `.env` with keys (see `README.md`).
 3) Run:
-   - `./run.sh TICKER.NS` (loads `.env`, activates venv) or `python main.py TICKER.NS --verbose`.
+- `./run.sh TICKER.NS` (loads `.env`, activates venv) or `python main.py TICKER.NS --verbose`.
 4) Mental model:
-   - `main.py` loads env → LangGraph `workflow` (`src/graph/workflow.py`).
-   - Flow: ContextSetup → Planner → sequential Technical/Fundamental/Sentiment analysts (self-correcting) → Ensemble (regime-aware strategy voting) → Critic (backtests + confidence) → Final synthesis.
-   - Key agents in `src/agents/*`; tools in `src/tools/*`; validation/retry in `src/validation` and `src/middleware`.
+- `main.py` loads env → LangGraph `workflow` (`src/graph/workflow.py`).
+- Flow: ContextSetup → Planner → sequential Technical/Fundamental/Sentiment analysts (self-correcting) → Ensemble (regime-aware strategy voting) → Critic (backtests + confidence) → Final synthesis.
+- Key agents in `src/agents/*`; tools in `src/tools/*`; validation/retry in `src/validation` and `src/middleware`.
 5) Contributing tips:
-   - Add new data tools under `src/tools/` and register with the relevant agent factory.
-   - Maintain structured logging (`ToolLogger`/`AgentLogger`) and validators when fetching data.
-   - Keep prompts concise; use `--verbose` during debugging and run `pytest` before PRs.
+- Add new data tools under `src/tools/` and register with the relevant agent factory.
+- Maintain structured logging (`ToolLogger`/`AgentLogger`) and validators when fetching data.
+- Keep prompts concise; use `--verbose` during debugging and run `pytest` before PRs.
 6) Common issues:
-   - Missing `GROQ_API_KEY` → run exits early.
-   - Rate limits on Groq → analysts are sequential to reduce 429s; rerun or lower concurrency if modified.
-   - Empty yfinance responses → check ticker suffix (e.g., `.NS`) and internet connectivity.
+- Missing `GROQ_API_KEY` → run exits early.
+- Rate limits on Groq → analysts are sequential to reduce 429s; rerun or lower concurrency if modified.
+- Empty yfinance responses → check ticker suffix (e.g., `.NS`) and internet connectivity.
 

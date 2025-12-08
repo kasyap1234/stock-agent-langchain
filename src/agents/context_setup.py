@@ -1,5 +1,6 @@
 import yfinance as yf
 from src.tools.regime_detection import _fetch_regime_data, _calculate_regime_indicators, _classify_regime
+from src.tools.market_data import fetch_realtime_quote_structured
 from typing import Dict, Any
 
 def setup_analysis_context(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -15,8 +16,11 @@ def setup_analysis_context(state: Dict[str, Any]) -> Dict[str, Any]:
         info = stock.info
         sector = info.get('sector', 'Unknown')
         context_updates["sector"] = sector
+
+        # 2. Live quote (validated and cached)
+        context_updates["quote"] = fetch_realtime_quote_structured(ticker)
         
-        # 2. Get Regime
+        # 3. Get Regime
         # We use the internal functions from regime_detection to get the raw classification
         df = _fetch_regime_data(ticker, period="6mo")
         if not df.empty and len(df) >= 50:
@@ -30,5 +34,14 @@ def setup_analysis_context(state: Dict[str, Any]) -> Dict[str, Any]:
         print(f"Error setting up context: {e}")
         context_updates["sector"] = "Unknown"
         context_updates["regime"] = "Unknown"
+        context_updates["quote"] = {
+            "ticker": ticker,
+            "price": None,
+            "currency": "N/A",
+            "as_of": None,
+            "stale": True,
+            "stale_reason": str(e),
+            "source": "yfinance"
+        }
         
     return context_updates

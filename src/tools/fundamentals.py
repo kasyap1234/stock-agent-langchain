@@ -22,6 +22,10 @@ def get_fundamental_metrics(ticker: str) -> str:
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
+
+        if not info:
+            logger.log_fetch(ticker, "fundamentals", False, 0, 0, "Empty fundamentals from provider")
+            return f"Fundamental data unavailable for {ticker} (provider returned empty info)."
         
         # Valuation
         pe = info.get('trailingPE', 'N/A')
@@ -81,6 +85,9 @@ def get_growth_metrics(ticker: str) -> str:
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
+
+        if not info:
+            return f"Growth data unavailable for {ticker} (provider returned empty info)."
         
         rev_growth = info.get('revenueGrowth', 'N/A')
         earnings_growth = info.get('earningsGrowth', 'N/A')

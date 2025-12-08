@@ -1,6 +1,11 @@
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
-from src.tools.market_data import get_stock_history, calculate_indicators, multi_timeframe_analysis
+from src.tools.market_data import (
+    get_stock_history,
+    calculate_indicators,
+    multi_timeframe_analysis,
+    get_realtime_quote,
+)
 from src.tools.search import web_search
 from src.utils.logging_config import AgentLogger
 import os
@@ -15,15 +20,17 @@ sent_logger = AgentLogger("sentiment_analyst")
 
 def create_technical_analyst():
     """Creates the Technical Analyst Agent with multi-timeframe analysis capability."""
-    tools = [get_stock_history, calculate_indicators, multi_timeframe_analysis]
+    tools = [get_realtime_quote, get_stock_history, calculate_indicators, multi_timeframe_analysis]
     system_message = (
         "You are a Technical Analyst for Indian Stocks with MULTI-TIMEFRAME capabilities. "
         "Your goal is to analyze price action and technical indicators to identify swing trading opportunities. "
         "\n\n"
+        "CRITICAL: Before citing any price/levels, call get_realtime_quote to anchor to the validated live price. "
         "CRITICAL: ALWAYS use multi_timeframe_analysis tool to check alignment across timeframes. "
         "This significantly improves accuracy by filtering false signals. "
         "\n\n"
         "Workflow:\n"
+        "0. Fetch live price via get_realtime_quote (never invent a price)\n"
         "1. Use multi_timeframe_analysis to check Weekly/Daily/4H alignment\n"
         "2. Use calculate_indicators for detailed technical analysis\n"
         "3. Use get_stock_history only if you need raw data\n"
@@ -32,6 +39,7 @@ def create_technical_analyst():
         "- Entry price\n"
         "- Target levels (at least 2)\n"
         "- Stop Loss\n"
+        "- Cite the live price and its as-of time; if unavailable, say 'Price unavailable' instead of fabricating\n"
         "- Timeframe alignment status (from multi_timeframe_analysis)\n"
         "- Confidence adjustment based on alignment\n"
         "\n"
@@ -43,12 +51,13 @@ from src.tools.fundamentals import get_fundamental_metrics, get_growth_metrics
 
 def create_fundamental_analyst():
     """Creates the Fundamental/News Analyst Agent."""
-    tools = [web_search, get_fundamental_metrics, get_growth_metrics]
+    tools = [get_realtime_quote, web_search, get_fundamental_metrics, get_growth_metrics]
     system_message = (
         "You are a Fundamental and News Analyst for Indian Stocks. "
         "Your goal is to evaluate the company's financial health and recent news. "
         "\n\n"
         "Workflow:\n"
+        "0. Fetch live price via get_realtime_quote and mention as-of; never guess prices.\n"
         "1. Use get_fundamental_metrics to check valuation (P/E, P/B) and profitability (ROE, Margins).\n"
         "2. Use get_growth_metrics to check recent growth trends.\n"
         "3. Use web_search to find upcoming earnings dates, major announcements, and sector news.\n"
