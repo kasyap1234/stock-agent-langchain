@@ -27,6 +27,50 @@ class MarketDataValidator:
     def __init__(self):
         self.logger = ToolLogger("MarketDataValidator")
 
+    def sanitize_dataframe(self, ticker: str, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalize index (tz-naive, sorted), drop duplicates, and remove all-null rows.
+
+        This is a non-destructive helper that keeps validation focused on clean data
+        without mutating the caller's frame.
+        """
+        if df is None or df.empty:
+            return df
+
+        clean_df = df.copy()
+
+        # Ensure datetime index
+        if not isinstance(clean_df.index, pd.DatetimeIndex):
+            try:
+                clean_df.index = pd.to_datetime(clean_df.index, errors="coerce")
+            except Exception:
+                return clean_df
+
+        # Drop NaT rows introduced by coercion
+        clean_df = clean_df[~clean_df.index.isna()]
+
+        # Normalize timezone to naive (UTC-consistent)
+        if clean_df.index.tz is not None:
+            clean_df.index = clean_df.index.tz_localize(None)
+
+        # Drop duplicates, keep latest
+        if clean_df.index.has_duplicates:
+            dup_count = clean_df.index.duplicated(keep="last").sum()
+            self.logger.log_validation(
+                ticker,
+                "dedupe_index",
+                passed=False,
+                reason=f"Removed {dup_count} duplicated timestamp rows",
+            )
+            clean_df = clean_df[~clean_df.index.duplicated(keep="last")]
+
+        # Sort for monotonic checks
+        clean_df = clean_df.sort_index()
+
+        # Drop rows where all columns are NaN
+        clean_df = clean_df.dropna(how="all")
+        return clean_df
+
     def validate_price_range(
         self,
         ticker: str,
@@ -127,6 +171,99 @@ class MarketDataValidator:
         except Exception as e:
             reason = f"Timestamp validation error: {str(e)}"
             self.logger.log_validation(ticker, "timestamp_freshness", False, reason)
+            return False, reason
+
+    def validate_calendar_alignment(
+        self,
+        ticker: str,
+        df: pd.DataFrame,
+        max_gap_days: int = 10,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Validate that the time index is monotonic and free of oversized gaps.
+
+        Accepts typical weekend/holiday gaps but flags very large holes or
+        descending indices which often indicate bad merges.
+        """
+        try:
+            if df.empty:
+                reason = "Empty DataFrame"
+                self.logger.log_validation(ticker, "calendar_alignment", False, reason)
+                return False, reason
+
+            if not isinstance(df.index, pd.DatetimeIndex):
+                reason = "Index is not datetime"
+                self.logger.log_validation(ticker, "calendar_alignment", False, reason)
+                return False, reason
+
+            if not df.index.is_monotonic_increasing:
+                reason = "Timestamps are not sorted ascending"
+                self.logger.log_validation(ticker, "calendar_alignment", False, reason)
+                return False, reason
+
+            # Check for abnormally large gaps
+            deltas = df.index.to_series().diff().dropna()
+            if not deltas.empty:
+                max_gap = deltas.max()
+                if pd.notna(max_gap) and max_gap > timedelta(days=max_gap_days):
+                    reason = f"Gap of {max_gap.days} days exceeds {max_gap_days}-day tolerance"
+                    self.logger.log_validation(ticker, "calendar_alignment", False, reason)
+                    return False, reason
+
+            self.logger.log_validation(ticker, "calendar_alignment", True)
+            return True, None
+        except Exception as e:
+            reason = f"Calendar alignment error: {str(e)}"
+            self.logger.log_validation(ticker, "calendar_alignment", False, reason)
+            return False, reason
+
+    def validate_outliers(
+        self,
+        ticker: str,
+        df: pd.DataFrame,
+        jump_threshold: float = 0.6,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Detect extreme single-bar price jumps that often indicate splits or bad ticks.
+
+        Args:
+            ticker: Stock ticker symbol
+            df: Historical price DataFrame
+            jump_threshold: Fractional move considered an outlier (e.g., 0.6 = 60%)
+        """
+        try:
+            if df.empty or len(df) < 2:
+                self.logger.log_validation(ticker, "price_outliers", True, "Insufficient data")
+                return True, None
+
+            price_cols = [c for c in ["Close", "Open", "High", "Low"] if c in df.columns]
+            if not price_cols:
+                self.logger.log_validation(ticker, "price_outliers", True, "No price columns found")
+                return True, None
+
+            pct_jumps = df[price_cols].pct_change().abs()
+            max_jump = float(pct_jumps.max().max())
+
+            if pd.isna(max_jump) or max_jump == 0:
+                self.logger.log_validation(ticker, "price_outliers", True)
+                return True, None
+
+            if max_jump > jump_threshold:
+                reason = f"Detected {max_jump*100:.1f}% single-bar move (> {jump_threshold*100:.0f}%)"
+                self.logger.log_validation(
+                    ticker,
+                    "price_outliers",
+                    False,
+                    reason,
+                    warning=True,
+                )
+                return False, reason
+
+            self.logger.log_validation(ticker, "price_outliers", True)
+            return True, None
+        except Exception as e:
+            reason = f"Outlier detection error: {str(e)}"
+            self.logger.log_validation(ticker, "price_outliers", False, reason)
             return False, reason
 
     def validate_completeness(
@@ -247,7 +384,8 @@ class MarketDataValidator:
         self,
         ticker: str,
         df: pd.DataFrame,
-        min_avg_volume: int = 100000
+        min_avg_volume: int = 100000,
+        window: int = 30
     ) -> Tuple[bool, Optional[str]]:
         """
         Validate that stock has adequate trading volume (not illiquid).
@@ -267,7 +405,9 @@ class MarketDataValidator:
                 return False, reason
 
             # Calculate average volume over recent period
-            avg_volume = df['Volume'].tail(30).mean()
+            if window <= 0:
+                window = 30
+            avg_volume = df['Volume'].tail(window).mean()
 
             if avg_volume < min_avg_volume:
                 reason = (
@@ -289,7 +429,9 @@ class MarketDataValidator:
         self,
         ticker: str,
         df: pd.DataFrame,
-        current_price: Optional[float] = None
+        current_price: Optional[float] = None,
+        min_avg_volume: Optional[int] = None,
+        volume_window: int = 30
     ) -> Dict[str, Tuple[bool, Optional[str]]]:
         """
         Run all validation checks and return results.
@@ -302,18 +444,26 @@ class MarketDataValidator:
         Returns:
             Dictionary of validation results
         """
+        cleaned_df = self.sanitize_dataframe(ticker, df)
+
         results = {
-            'completeness': self.validate_completeness(ticker, df),
-            'timestamp_freshness': self.validate_timestamp_freshness(ticker, df),
-            'volume_adequacy': self.validate_volume_adequacy(ticker, df),
-            'corporate_actions': self.detect_corporate_actions(ticker, df),
+            'calendar_alignment': self.validate_calendar_alignment(ticker, cleaned_df),
+            'completeness': self.validate_completeness(ticker, cleaned_df),
+            'timestamp_freshness': self.validate_timestamp_freshness(ticker, cleaned_df),
+            'volume_adequacy': self.validate_volume_adequacy(
+                ticker, cleaned_df, min_avg_volume or 100000, window=volume_window
+            ),
+            'price_outliers': self.validate_outliers(ticker, cleaned_df),
+            'corporate_actions': self.detect_corporate_actions(ticker, cleaned_df),
         }
 
         if current_price is not None:
-            results['price_range'] = self.validate_price_range(ticker, current_price, df)
+            results['price_range'] = self.validate_price_range(ticker, current_price, cleaned_df)
 
         # Log overall validation result
-        all_passed = all(result[0] for key, result in results.items() if key != 'corporate_actions')
+        all_passed = all(
+            result[0] for key, result in results.items() if key not in {'corporate_actions'}
+        )
         self.logger.logger.info(
             "full_validation",
             ticker=ticker,

@@ -4,7 +4,7 @@ import ta
 import time
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, List
 from langchain.tools import tool
 from src.utils.logging_config import ToolLogger
 from src.validation.data_validators import MarketDataValidator, ValidationError
@@ -13,6 +13,20 @@ from src.middleware.retry_handler import retry_yfinance
 # Initialize logger and validator
 logger = ToolLogger("market_data")
 validator = MarketDataValidator()
+
+# Cache configuration
+_quote_cache: Dict[str, Dict[str, Any]] = {}
+_QUOTE_CACHE_TTL_SECONDS = 45
+_INTRADAY_PERIOD = "1d"
+_INTRADAY_INTERVAL = "1m"
+_DAILY_PERIOD = "5d"
+_MAX_INTRADAY_AGE_DAYS = 2
+_MAX_DAILY_AGE_DAYS = 5
+_VOLUME_DAILY_THRESHOLD = 100_000  # baseline minimum average daily volume
+_INTRADAY_BARS_PER_DAY = 390       # approx. 6.5 trading hours at 1m bars
+_MIN_PER_BAR_VOLUME = 200          # floor to avoid zero/near-zero threshold
+_HISTORY_CACHE_TTL_SECONDS = 90
+_history_cache: Dict[Tuple[str, str, Optional[str]], Dict[str, Any]] = {}
 
 
 def _get_attr_or_item(obj: Any, key: str) -> Optional[Any]:
@@ -55,6 +69,72 @@ def _extract_fast_info(stock: Any) -> Dict[str, Any]:
     }
 
 
+@retry_yfinance
+def _fetch_history(ticker: str, period: str, interval: Optional[str] = None) -> pd.DataFrame:
+    """Centralized history fetch with retry/backoff."""
+    cache_key = (ticker, period, interval)
+    now = time.time()
+    cached = _history_cache.get(cache_key)
+    if cached and (now - cached["fetched_at"]) < _HISTORY_CACHE_TTL_SECONDS:
+        return cached["data"].copy()
+
+    stock = yf.Ticker(ticker)
+    df = stock.history(period=period, interval=interval)
+    df = validator.sanitize_dataframe(ticker, df)
+    _history_cache[cache_key] = {"fetched_at": now, "data": df.copy()}
+    return df
+
+
+def _collect_validation_failures(results: Dict[str, Tuple[bool, Optional[str]]]) -> List[str]:
+    """Return a list of validation failures excluding non-critical warnings."""
+    failures: List[str] = []
+    for check, (passed, reason) in results.items():
+        if passed:
+            continue
+        if check == "corporate_actions":
+            # Corporate actions are warnings, not hard failures
+            continue
+        if reason:
+            failures.append(reason)
+    return failures
+
+
+def _per_bar_volume_threshold(df: pd.DataFrame, interval: Optional[str]) -> int:
+    """
+    Compute an interval-aware volume threshold to avoid flagging intraday bars as illiquid.
+
+    For intraday 1m data, scale the daily threshold by expected bars-per-day.
+    """
+    if interval == "1m":
+        bars = min(max(len(df), 1), _INTRADAY_BARS_PER_DAY)
+        per_bar = max(_VOLUME_DAILY_THRESHOLD // max(bars, 1), _MIN_PER_BAR_VOLUME)
+        return int(per_bar)
+    return _VOLUME_DAILY_THRESHOLD
+
+
+def _assess_coverage(df: pd.DataFrame, expected_bars: int, label: str) -> Tuple[bool, Optional[str]]:
+    """
+    Flag datasets that are too sparse to be relied on.
+
+    Keeps the threshold lenient to avoid false alarms during live sessions or holidays.
+    """
+    if df is None or df.empty or expected_bars <= 0:
+        return False, f"{label} data missing"
+
+    coverage = len(df) / expected_bars
+    if coverage < 0.05:
+        return False, f"{label} data too sparse ({coverage:.1%} of expected bars)"
+    return True, None
+
+
+def _isoformat(ts: Optional[datetime]) -> str:
+    if ts is None:
+        return datetime.now(timezone.utc).isoformat()
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.isoformat()
+
+
 def fetch_realtime_quote_structured(ticker: str) -> Dict[str, Any]:
     """
     Fetch a near real-time quote for a ticker with freshness validation and caching.
@@ -77,16 +157,19 @@ def fetch_realtime_quote_structured(ticker: str) -> Dict[str, Any]:
         return cached["data"]
 
     start_time = time.time()
+    error_type = None
+    validation_failures: List[str] = []
     try:
         stock = yf.Ticker(ticker)
         fast_bits = _extract_fast_info(stock)
 
         # Try to get 1-minute data for freshness
-        intraday_df = pd.DataFrame()
+        intraday_error = None
         try:
-            intraday_df = stock.history(period="1d", interval="1m")
-        except Exception:
+            intraday_df = _fetch_history(ticker, _INTRADAY_PERIOD, _INTRADAY_INTERVAL)
+        except Exception as e:  # noqa: PERF203 - needs broad catch to classify errors
             intraday_df = pd.DataFrame()
+            intraday_error = str(e)
 
         last_ts = None
         hist_price = None
@@ -101,38 +184,103 @@ def fetch_realtime_quote_structured(ticker: str) -> Dict[str, Any]:
 
         stale = False
         stale_reason = None
+        data_age_seconds = None
+
+        if last_ts:
+            now_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+            data_age_seconds = (now_ts - last_ts).total_seconds()
 
         if intraday_df is not None and not intraday_df.empty:
-            valid, reason = validator.validate_timestamp_freshness(ticker, intraday_df, max_age_days=2)
-            stale = not valid
-            stale_reason = reason
+            volume_threshold = _per_bar_volume_threshold(intraday_df, _INTRADAY_INTERVAL)
+            coverage_ok, coverage_reason = _assess_coverage(
+                intraday_df, _INTRADAY_BARS_PER_DAY, "Intraday"
+            )
+            # Enforce freshness and overall data quality
+            valid_ts, ts_reason = validator.validate_timestamp_freshness(
+                ticker, intraday_df, max_age_days=_MAX_INTRADAY_AGE_DAYS
+            )
+            validations = validator.validate_all(
+                ticker,
+                intraday_df,
+                current_price=price,
+                min_avg_volume=volume_threshold,
+                volume_window=min(len(intraday_df), 200),
+            )
+            validation_failures = _collect_validation_failures(validations)
+
+            if not coverage_ok:
+                stale = True
+                stale_reason = coverage_reason
+                error_type = "partial_intraday"
+            if not valid_ts:
+                stale = True
+                stale_reason = stale_reason or ts_reason
+                error_type = error_type or "stale_data"
+            if validation_failures:
+                stale = True
+                joined_failures = "; ".join(validation_failures)
+                stale_reason = stale_reason or joined_failures
+                error_type = error_type or "validation_failed"
         else:
             stale = True
-            stale_reason = "No intraday data returned"
+            stale_reason = intraday_error or "No intraday data returned"
+            error_type = "no_intraday_data"
 
         # If we still have no price, try daily history as last resort
         if price is None:
+            daily_error = None
             try:
-                daily_df = stock.history(period="5d")
-                if not daily_df.empty:
+                volume_threshold = _VOLUME_DAILY_THRESHOLD
+                daily_df = _fetch_history(ticker, _DAILY_PERIOD)
+                if daily_df is not None and not daily_df.empty:
                     price = float(daily_df["Close"].iloc[-1])
                     last_ts = pd.to_datetime(daily_df.index[-1]).tz_localize(None)
-                    valid, reason = validator.validate_timestamp_freshness(ticker, daily_df, max_age_days=5)
-                    stale = not valid
-                    stale_reason = reason
-            except Exception as e:
+                    now_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+                    data_age_seconds = (now_ts - last_ts).total_seconds()
+
+                    coverage_ok, coverage_reason = _assess_coverage(daily_df, 5, "Daily")
+                    valid_ts, ts_reason = validator.validate_timestamp_freshness(
+                        ticker, daily_df, max_age_days=_MAX_DAILY_AGE_DAYS
+                    )
+                    validations = validator.validate_all(
+                        ticker,
+                        daily_df,
+                        current_price=price,
+                        min_avg_volume=volume_threshold,
+                        volume_window=min(len(daily_df), 60),
+                    )
+                    validation_failures = _collect_validation_failures(validations)
+
+                    if not coverage_ok:
+                        stale = True
+                        stale_reason = stale_reason or coverage_reason
+                        error_type = error_type or "partial_daily"
+                    if not valid_ts:
+                        stale = True
+                        stale_reason = ts_reason
+                        error_type = "stale_data"
+                    if validation_failures:
+                        stale = True
+                        joined_failures = "; ".join(validation_failures)
+                        stale_reason = stale_reason or joined_failures
+                        error_type = error_type or "validation_failed"
+                else:
+                    stale = True
+                    stale_reason = daily_error or stale_reason or "Daily history unavailable"
+            except Exception as e:  # noqa: PERF203 - classification
                 stale = True
-                stale_reason = stale_reason or f"Daily history unavailable: {e}"
+                daily_error = str(e)
+                stale_reason = stale_reason or f"Daily history unavailable: {daily_error}"
+                error_type = error_type or "daily_history_error"
 
         if price is None:
             stale = True
             stale_reason = stale_reason or "Price unavailable from data source"
+            error_type = error_type or "no_price"
         else:
             price = float(price)
 
-        as_of = (
-            last_ts.isoformat() if last_ts else datetime.now(timezone.utc).isoformat()
-        )
+        as_of = _isoformat(last_ts)
 
         currency = (currency or "N/A")
         if isinstance(currency, str):
@@ -144,19 +292,24 @@ def fetch_realtime_quote_structured(ticker: str) -> Dict[str, Any]:
             "currency": currency or "N/A",
             "previous_close": float(previous_close) if previous_close is not None else None,
             "as_of": as_of,
+            "data_age_seconds": data_age_seconds,
             "stale": bool(stale),
             "stale_reason": stale_reason,
+            "error_type": error_type,
             "source": "yfinance",
+            "validation_failures": validation_failures,
         }
 
         latency_ms = (time.time() - start_time) * 1000
         logger.log_fetch(
             ticker=ticker,
             data_type="realtime_quote",
-            success=price is not None,
+            success=price is not None and not validation_failures,
             latency_ms=latency_ms,
             records_fetched=len(intraday_df) if intraday_df is not None else 0,
             error=stale_reason if price is None else None,
+            data_age_seconds=data_age_seconds,
+            source="yfinance",
         )
 
         _quote_cache[ticker] = {"fetched_at": now, "data": quote}
@@ -170,6 +323,7 @@ def fetch_realtime_quote_structured(ticker: str) -> Dict[str, Any]:
             latency_ms=latency_ms,
             records_fetched=0,
             error=str(e),
+            source="yfinance",
         )
         return {
             "ticker": ticker,
@@ -181,6 +335,7 @@ def fetch_realtime_quote_structured(ticker: str) -> Dict[str, Any]:
             "stale_reason": str(e),
             "source": "yfinance",
             "error": str(e),
+            "error_type": "exception",
         }
 
 
@@ -218,10 +373,6 @@ def get_realtime_quote(ticker: str) -> str:
 
     # Make the JSON payload easy to parse downstream
     return summary + f"\nJSON:{json.dumps(data, default=str)}"
-
-# Lightweight in-memory cache to reduce repeat yfinance calls for quotes
-_quote_cache: Dict[str, Dict[str, Any]] = {}
-_QUOTE_CACHE_TTL_SECONDS = 45
 
 @tool
 def get_stock_history(ticker: str, period: str = "1y") -> str:
@@ -279,8 +430,16 @@ Last 30 days:
 @retry_yfinance
 def _fetch_stock_data_with_retry(ticker: str, period: str) -> pd.DataFrame:
     """Helper function to fetch stock data with automatic retry."""
+    cache_key = (ticker, period, None)
+    now = time.time()
+    cached = _history_cache.get(cache_key)
+    if cached and (now - cached["fetched_at"]) < _HISTORY_CACHE_TTL_SECONDS:
+        return cached["data"].copy()
+
     stock = yf.Ticker(ticker)
     df = stock.history(period=period)
+    df = validator.sanitize_dataframe(ticker, df)
+    _history_cache[cache_key] = {"fetched_at": now, "data": df.copy()}
     return df
 
 @tool
@@ -351,6 +510,65 @@ def calculate_indicators(ticker: str, period: str = "1y") -> str:
         else:
             volume_line = f"Volume: {latest['Volume']:.0f} (20d avg unavailable)"
 
+        # Derive directional bias and confidence from multiple indicators
+        bull_points = 0
+        bear_points = 0
+        signal_notes: List[str] = []
+
+        if latest['Close'] > latest['ema_50'] and latest['ema_50'] > latest['ema_200']:
+            bull_points += 1
+            signal_notes.append("Price above EMA50/200 (uptrend)")
+        elif latest['Close'] < latest['ema_50'] and latest['ema_50'] < latest['ema_200']:
+            bear_points += 1
+            signal_notes.append("Price below EMA50/200 (downtrend)")
+        else:
+            signal_notes.append("Price near EMAs (range)")
+
+        if latest['macd'] > latest['macd_signal']:
+            bull_points += 1
+            signal_notes.append("MACD > signal (bullish momentum)")
+        else:
+            bear_points += 1
+            signal_notes.append("MACD < signal (bearish momentum)")
+
+        if latest['rsi'] >= 60:
+            bull_points += 1
+            signal_notes.append("RSI > 60 (buying pressure)")
+        elif latest['rsi'] <= 40:
+            bear_points += 1
+            signal_notes.append("RSI < 40 (selling pressure)")
+        else:
+            signal_notes.append("RSI in neutral band (40-60)")
+
+        if vol_ratio is not None:
+            if vol_ratio >= 1.2:
+                bull_points += 1
+                signal_notes.append(f"Volume {vol_ratio:.2f}x avg (participation strong)")
+            elif vol_ratio <= 0.8:
+                bear_points += 1
+                signal_notes.append(f"Volume {vol_ratio:.2f}x avg (participation weak)")
+            else:
+                signal_notes.append(f"Volume {vol_ratio:.2f}x avg (neutral)")
+
+        score = bull_points - bear_points
+        conflict = bull_points > 0 and bear_points > 0
+
+        if score >= 2:
+            bias = "Bullish"
+            confidence = 65 + min(score, 3) * 5
+        elif score <= -2:
+            bias = "Bearish"
+            confidence = 65 + min(abs(score), 3) * 5
+        else:
+            bias = "Neutral"
+            confidence = 55 if score == 1 or score == -1 else 50
+
+        if conflict:
+            confidence -= 10
+
+        confidence = max(20, min(90, confidence))
+        signal_summary = "; ".join(signal_notes[:4])
+
         report = f"""
 Technical Indicators for {ticker} (Date: {latest.name.date()}):
 Data validated and fresh
@@ -364,6 +582,9 @@ EMA 200: {latest['ema_200']:.2f}
 Bollinger Bands: High {latest['bb_high']:.2f}, Low {latest['bb_low']:.2f}
 ATR (14): {atr_14:.2f}
 {volume_line}
+
+Bias: {bias} | Confidence: {confidence:.0f}%
+Signals: {signal_summary}
 """
         return report
 
@@ -599,6 +820,7 @@ ALIGNMENT ASSESSMENT:
 {alignment['message']}
 
 Confidence Adjustment: {alignment['confidence_adjustment']:+d}%
+Overall Confidence: {max(20, min(90, 50 + alignment['confidence_adjustment'])):.0f}% (base 50% + alignment adj)
 
 TRADING IMPLICATIONS:
 """

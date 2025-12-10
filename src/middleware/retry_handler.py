@@ -106,7 +106,8 @@ def with_retry(
                             ticker=ticker,
                             attempt=attempt + 1,
                             max_attempts=config.max_attempts,
-                            error=str(e)
+                            error=str(e),
+                            retryable=True,
                         )
                     else:
                         logger.logger.warning(
@@ -128,7 +129,8 @@ def with_retry(
                 function=func.__name__,
                 ticker=ticker,
                 attempts=config.max_attempts,
-                error=str(last_exception)
+                error=str(last_exception),
+                retryable=False,
             )
 
             if fallback_value is not None:

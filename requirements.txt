@@ -9,3 +9,4 @@ duckduckgo-search
 ddgs
 python-dotenv
 structlog
+scikit-learn

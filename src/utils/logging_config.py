@@ -165,6 +165,9 @@ class ToolLogger:
         latency_ms: float,
         records_fetched: Optional[int] = None,
         error: Optional[str] = None,
+        data_age_seconds: Optional[float] = None,
+        source: Optional[str] = None,
+        attempt: Optional[int] = None,
     ):
         """Log a data fetch operation."""
         self.logger.info(
@@ -176,6 +179,9 @@ class ToolLogger:
             latency_ms=latency_ms,
             records_fetched=records_fetched,
             error=error,
+            data_age_seconds=data_age_seconds,
+            source=source,
+            attempt=attempt,
         )
 
     def log_validation(
@@ -203,6 +209,7 @@ class ToolLogger:
         attempt: int,
         max_attempts: int,
         error: str,
+        retryable: bool = True,
     ):
         """Log a retry attempt."""
         self.logger.warning(
@@ -212,6 +219,7 @@ class ToolLogger:
             attempt=attempt,
             max_attempts=max_attempts,
             error=error,
+            retryable=retryable,
         )
 
 

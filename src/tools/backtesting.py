@@ -1,71 +1,188 @@
 """
 Backtesting tools for validating trade calls against historical data.
+Adds input validation, retries, and structured outputs to help downstream agents.
 """
-import yfinance as yf
-import pandas as pd
+import json
+import time
 from datetime import datetime, timedelta
+from typing import Optional, Dict, Tuple
+
+import pandas as pd
+import yfinance as yf
 from langchain.tools import tool
-from typing import Dict
+
+from src.middleware.retry_handler import retry_yfinance
+from src.utils.logging_config import ToolLogger
+from src.validation.data_validators import MarketDataValidator
+
+bt_logger = ToolLogger("backtesting")
+bt_validator = MarketDataValidator()
+_HISTORY_CACHE_TTL_SECONDS = 90
+_history_cache: Dict[Tuple[str, str, str], Dict[str, pd.DataFrame]] = {}
+
+
+def _compute_dynamic_cost(df: pd.DataFrame, slippage_bps: int, fee_bps: int) -> float:
+    """
+    Estimate round-trip cost (%) using liquidity and intraday volatility.
+
+    Returns percentage (not decimal) to align with downstream calculations.
+    """
+    base_per_leg = (slippage_bps + fee_bps) / 10000  # decimal
+    if df is None or df.empty:
+        return base_per_leg * 2 * 100
+
+    range_pct = ((df["High"] - df["Low"]) / df["Close"]).tail(20).mean()
+    vol_factor = 1 + min(range_pct * 5, 1.0) if pd.notna(range_pct) else 1.0
+
+    volume_mean = df["Volume"].tail(20).mean()
+    liquidity_factor = 1.0
+    if volume_mean and not pd.isna(volume_mean):
+        if volume_mean < 500_000:
+            liquidity_factor = 1.2
+        elif volume_mean > 2_000_000:
+            liquidity_factor = 0.9
+
+    return base_per_leg * vol_factor * liquidity_factor * 2 * 100
+
+
+@retry_yfinance
+def _fetch_history(ticker: str, start: datetime, end: datetime) -> pd.DataFrame:
+    cache_key = (ticker, start.date().isoformat(), end.date().isoformat())
+    now = time.time()
+    cached = _history_cache.get(cache_key)
+    if cached and (now - cached["fetched_at"]) < _HISTORY_CACHE_TTL_SECONDS:
+        return cached["data"].copy()
+
+    stock = yf.Ticker(ticker)
+    df = stock.history(start=start, end=end)
+    df = bt_validator.sanitize_dataframe(ticker, df)
+    _history_cache[cache_key] = {"fetched_at": now, "data": df.copy()}
+    return df
+
+
+def _first_hit_index(df: pd.DataFrame, target: float, column: str, comparison) -> Optional[pd.Timestamp]:
+    mask = comparison(df[column], target)
+    if not mask.any():
+        return None
+    return mask.idxmax()
+
+
+def _validate_inputs(entry_price: float, target_price: float, stop_loss: float) -> Optional[str]:
+    if entry_price <= 0 or target_price <= 0 or stop_loss <= 0:
+        return "Prices must be positive numbers."
+    if stop_loss >= entry_price:
+        return "Stop loss should be below entry price for long setups."
+    if target_price <= entry_price:
+        return "Target price should exceed entry price for long setups."
+    return None
 
 @tool
-def backtest_trade_call(ticker: str, entry_price: float, target_price: float, stop_loss: float, days_back: int = 30) -> str:
+def backtest_trade_call(
+    ticker: str,
+    entry_price: float,
+    target_price: float,
+    stop_loss: float,
+    days_back: int = 30,
+    slippage_bps: int = 10,
+    fee_bps: int = 5,
+) -> str:
     """
     Backtests a trade call against the last N days of historical data.
-    
-    Args:
-        ticker: Stock ticker (e.g., "RELIANCE.NS")
-        entry_price: Proposed entry price
-        target_price: Proposed target price
-        stop_loss: Proposed stop loss price
-        days_back: Number of days to backtest (default 30)
-    
-    Returns:
-        Backtest results with win rate, risk-reward, and confidence score
+
+    Adds validation, ordered hit detection, and structured payloads.
     """
+    start_time = time.time()
+    validation_error = _validate_inputs(entry_price, target_price, stop_loss)
+    if validation_error:
+        return f"Invalid inputs: {validation_error}"
+
     try:
-        # Fetch historical data
-        stock = yf.Ticker(ticker)
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days_back * 2)  # Get extra data for context
-        df = stock.history(start=start_date, end=end_date)
-        
+        df = _fetch_history(ticker, start=start_date, end=end_date)
+
         if df.empty:
             return f"No historical data available for {ticker}"
-        
-        # Get the most recent N days
+
         df = df.tail(days_back)
-        
-        # Calculate what would have happened if we entered at entry_price
-        current_price = df['Close'].iloc[-1]
-        high_in_period = df['High'].max()
-        low_in_period = df['Low'].min()
-        
-        # Simulate the trade
-        would_hit_target = high_in_period >= target_price
-        would_hit_stop = low_in_period <= stop_loss
-        
-        # Calculate risk-reward
-        potential_gain = ((target_price - entry_price) / entry_price) * 100
-        potential_loss = ((entry_price - stop_loss) / entry_price) * 100
-        risk_reward = potential_gain / potential_loss if potential_loss > 0 else 0
-        
-        # Determine outcome
+        if df.empty:
+            return f"No data in requested window for {ticker}"
+
+        # Basic data quality checks
+        validations = bt_validator.validate_all(ticker, df)
+        failures = [r for r in validations.values() if not r[0] and r[1]]
+        if failures:
+            reason = failures[0][1]
+            return f"Data quality issue for {ticker}: {reason}"
+
+        current_price = float(df["Close"].iloc[-1])
+        high_in_period = float(df["High"].max())
+        low_in_period = float(df["Low"].min())
+
+        # Ordered hit detection (target vs stop)
+        target_hit_at = _first_hit_index(df, target_price, "High", lambda series, t: series >= t)
+        stop_hit_at = _first_hit_index(df, stop_loss, "Low", lambda series, t: series <= t)
+
+        would_hit_target = target_hit_at is not None
+        would_hit_stop = stop_hit_at is not None
+
         if would_hit_target and would_hit_stop:
-            outcome = "MIXED - Both target and stop loss were hit in period"
-            confidence = 50
+            if target_hit_at < stop_hit_at:
+                outcome = "WIN - Target reached before stop"
+                confidence = 75
+                first_event = target_hit_at
+            elif stop_hit_at < target_hit_at:
+                outcome = "LOSS - Stop reached before target"
+                confidence = 35
+                first_event = stop_hit_at
+            else:
+                outcome = "MIXED - Target and stop hit same session"
+                confidence = 50
+                first_event = target_hit_at
         elif would_hit_target:
             outcome = "WIN - Target would have been hit"
             confidence = 80
+            first_event = target_hit_at
         elif would_hit_stop:
             outcome = "LOSS - Stop loss would have been hit"
             confidence = 30
+            first_event = stop_hit_at
         else:
-            outcome = "PENDING - Neither target nor stop loss hit yet"
+            outcome = "PENDING - Neither target nor stop hit"
             confidence = 60
-        
-        # Calculate price movement correlation
+            first_event = None
+
+        potential_gain = ((target_price - entry_price) / entry_price) * 100
+        potential_loss = ((entry_price - stop_loss) / entry_price) * 100
+        risk_reward = potential_gain / potential_loss if potential_loss > 0 else 0
         price_change = ((current_price - entry_price) / entry_price) * 100
-        
+        round_trip_cost_pct = _compute_dynamic_cost(df, slippage_bps, fee_bps)
+        potential_gain_net = max(potential_gain - round_trip_cost_pct, 0)
+        potential_loss_net = potential_loss + round_trip_cost_pct
+        risk_reward_net = potential_gain_net / potential_loss_net if potential_loss_net > 0 else 0
+
+        payload = {
+            "ticker": ticker,
+            "window_days": days_back,
+            "entry_price": entry_price,
+            "target_price": target_price,
+            "stop_loss": stop_loss,
+            "current_price": current_price,
+            "high": high_in_period,
+            "low": low_in_period,
+            "target_hit_at": str(target_hit_at) if target_hit_at is not None else None,
+            "stop_hit_at": str(stop_hit_at) if stop_hit_at is not None else None,
+            "outcome": outcome,
+            "confidence": confidence,
+            "risk_reward": risk_reward,
+            "risk_reward_net": risk_reward_net,
+            "price_change_pct": price_change,
+            "round_trip_cost_pct": round_trip_cost_pct,
+            "slippage_bps": slippage_bps,
+            "fee_bps": fee_bps,
+            "first_event": str(first_event) if first_event is not None else None,
+        }
+
         report = f"""
 BACKTEST RESULTS ({days_back} days):
 {'='*50}
@@ -81,14 +198,31 @@ Historical Range:
 
 Outcome: {outcome}
 Risk-Reward Ratio: {risk_reward:.2f}:1
+Risk-Reward (after costs): {risk_reward_net:.2f}:1 | Costs: {round_trip_cost_pct:.2f}% round-trip (slip {slippage_bps}bps, fees {fee_bps}bps)
 Price Change from Entry: {price_change:+.2f}%
-
 Confidence Score: {confidence}% 
 {'='*50}
 """
-        return report
-        
-    except Exception as e:
+        latency_ms = (time.time() - start_time) * 1000
+        bt_logger.log_fetch(
+            ticker=ticker,
+            data_type="backtest_trade_call",
+            success=True,
+            latency_ms=latency_ms,
+            records_fetched=len(df),
+        )
+        return report + f"\nJSON:{json.dumps(payload, default=str)}"
+
+    except Exception as e:  # noqa: PERF203 - user-facing error path
+        latency_ms = (time.time() - start_time) * 1000
+        bt_logger.log_fetch(
+            ticker=ticker,
+            data_type="backtest_trade_call",
+            success=False,
+            latency_ms=latency_ms,
+            records_fetched=0,
+            error=str(e),
+        )
         return f"Backtest error for {ticker}: {str(e)}"
         
 @tool
@@ -111,10 +245,14 @@ def perform_walk_forward_analysis(ticker: str, strategy_type: str = "Trend Follo
         stock = yf.Ticker(ticker)
         # Get 2 years of data
         df = stock.history(period="2y")
-        
+
         if df.empty or len(df) < 200:
             return f"Insufficient data for walk-forward analysis for {ticker}"
-            
+
+        df = df.dropna(subset=["Close"])
+        if df.empty:
+            return f"Insufficient clean price data for {ticker}"
+
         # Define window size (e.g., 6 months train, 2 months test)
         total_days = len(df)
         window_size = total_days // (windows + 1)
@@ -170,7 +308,7 @@ def perform_walk_forward_analysis(ticker: str, strategy_type: str = "Trend Follo
         # Aggregate Results
         avg_test_return = sum(r['test_return'] for r in results) / len(results)
         robustness = sum(1 for r in results if r['test_return'] > 0) / len(results) * 100
-        
+
         report = f"""
 WALK-FORWARD ANALYSIS: {ticker} ({strategy_type})
 {'='*50}
@@ -181,11 +319,20 @@ DETAILS:
 """
         for r in results:
             report += f"Window {r['window']}: Train {r['train_return']:.1f}% -> Test {r['test_return']:.1f}% | Params: {r['params']} | Trades: {r['trades']}\n"
-            
+
         report += "="*50
-        return report
-        
-    except Exception as e:
+
+        payload = {
+            "ticker": ticker,
+            "strategy_type": strategy_type,
+            "windows": results,
+            "avg_test_return": avg_test_return,
+            "robustness": robustness,
+        }
+
+        return report + f"\nJSON:{json.dumps(payload, default=str)}"
+
+    except Exception as e:  # noqa: PERF203 - user-facing error path
         return f"Walk-forward analysis error: {str(e)}"
 
 def _optimize_ma_strategy(df):
