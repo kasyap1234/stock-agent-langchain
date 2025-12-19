@@ -7,18 +7,38 @@ Prevents "garbage in, garbage out" by validating:
 - Completeness (no missing values)
 - Corporate actions (splits, dividends)
 - Volume adequacy (detect illiquid stocks)
+- Indian market specifics (NSE hours, holidays, circuit breakers)
 """
 
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, timedelta
-from typing import Dict, Tuple, Optional
+from datetime import datetime, timedelta, time
+from typing import Dict, Tuple, Optional, Set
 from src.utils.logging_config import ToolLogger
 
 
 class ValidationError(Exception):
     """Raised when data validation fails."""
     pass
+
+
+# NSE Holidays 2024-2025
+NSE_HOLIDAYS: Set[str] = {
+    # 2024
+    "2024-01-26", "2024-03-08", "2024-03-25", "2024-03-29", "2024-04-11",
+    "2024-04-14", "2024-04-17", "2024-04-21", "2024-05-01", "2024-05-23",
+    "2024-06-17", "2024-07-17", "2024-08-15", "2024-10-02", "2024-11-01",
+    "2024-11-15", "2024-12-25",
+    # 2025
+    "2025-01-26", "2025-02-26", "2025-03-14", "2025-03-31", "2025-04-10",
+    "2025-04-14", "2025-04-18", "2025-05-01", "2025-05-12", "2025-06-07",
+    "2025-07-06", "2025-08-15", "2025-08-16", "2025-10-02", "2025-10-21",
+    "2025-10-22", "2025-11-05", "2025-12-25",
+}
+
+# NSE Trading Hours
+NSE_OPEN = time(9, 15)
+NSE_CLOSE = time(15, 30)
 
 
 class MarketDataValidator:
@@ -86,11 +106,12 @@ class MarketDataValidator:
     ) -> Tuple[bool, Optional[str]]:
         """
         Validate that data is recent (not stale).
+        Uses NSE holiday calendar for Indian stocks (.NS/.BO suffix).
 
         Args:
             ticker: Stock ticker symbol
             df: Historical price DataFrame with DatetimeIndex
-            max_age_days: Maximum acceptable age in days
+            max_age_days: Maximum acceptable age in business days
 
         Returns:
             (is_valid, reason) tuple
@@ -107,19 +128,33 @@ class MarketDataValidator:
                 last_date = last_date.tz_localize(None)
             current_date = pd.Timestamp.now()
 
-            # Account for weekends and market holidays
-            age_days = (current_date - last_date).days
+            # Check if Indian stock
+            is_indian = ticker.endswith('.NS') or ticker.endswith('.BO')
 
-            # Allow extra days for weekends (up to 3 days for weekend + holiday)
-            adjusted_max_age = max_age_days + 3
+            if is_indian:
+                # Calculate business days excluding NSE holidays
+                business_days = self._count_nse_trading_days(last_date, current_date)
+                adjusted_max_age = max_age_days
 
-            if age_days > adjusted_max_age:
-                reason = (
-                    f"Data is stale: Last date {last_date.date()}, "
-                    f"age {age_days} days (max {adjusted_max_age})"
-                )
-                self.logger.log_validation(ticker, "timestamp_freshness", False, reason)
-                return False, reason
+                if business_days > adjusted_max_age:
+                    reason = (
+                        f"Data is stale: Last date {last_date.date()}, "
+                        f"{business_days} NSE trading days old (max {adjusted_max_age})"
+                    )
+                    self.logger.log_validation(ticker, "timestamp_freshness", False, reason)
+                    return False, reason
+            else:
+                # Non-Indian stocks: use calendar days with weekend buffer
+                age_days = (current_date - last_date).days
+                adjusted_max_age = max_age_days + 3
+
+                if age_days > adjusted_max_age:
+                    reason = (
+                        f"Data is stale: Last date {last_date.date()}, "
+                        f"age {age_days} days (max {adjusted_max_age})"
+                    )
+                    self.logger.log_validation(ticker, "timestamp_freshness", False, reason)
+                    return False, reason
 
             self.logger.log_validation(ticker, "timestamp_freshness", True)
             return True, None
@@ -128,6 +163,24 @@ class MarketDataValidator:
             reason = f"Timestamp validation error: {str(e)}"
             self.logger.log_validation(ticker, "timestamp_freshness", False, reason)
             return False, reason
+
+    def _count_nse_trading_days(
+        self,
+        start_date: pd.Timestamp,
+        end_date: pd.Timestamp
+    ) -> int:
+        """Count NSE trading days between two dates (excluding weekends and NSE holidays)."""
+        count = 0
+        current = start_date + timedelta(days=1)
+
+        while current <= end_date:
+            date_str = current.strftime('%Y-%m-%d')
+            # Skip weekends (5=Sat, 6=Sun)
+            if current.weekday() < 5 and date_str not in NSE_HOLIDAYS:
+                count += 1
+            current += timedelta(days=1)
+
+        return count
 
     def validate_completeness(
         self,
@@ -285,6 +338,68 @@ class MarketDataValidator:
             self.logger.log_validation(ticker, "volume_adequacy", False, reason)
             return False, reason
 
+    def detect_circuit_breaker_risk(
+        self,
+        ticker: str,
+        df: pd.DataFrame,
+        lookback_days: int = 10
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Detect if stock has hit or is near circuit breaker limits.
+        Indian stocks have circuit limits at 2%, 5%, 10%, or 20% depending on category.
+        F&O stocks have no circuit limits.
+
+        Args:
+            ticker: Stock ticker symbol
+            df: Historical price DataFrame
+            lookback_days: Days to analyze
+
+        Returns:
+            (has_risk, description) tuple - True means circuit risk detected
+        """
+        try:
+            if df.empty or len(df) < 2:
+                return False, None
+
+            # Check if Indian stock
+            is_indian = ticker.endswith('.NS') or ticker.endswith('.BO')
+            if not is_indian:
+                return False, None
+
+            recent_df = df.tail(lookback_days)
+
+            # Calculate daily moves
+            daily_change = recent_df['Close'].pct_change().abs()
+
+            # Check for circuit-like moves (>=10% single day)
+            circuit_threshold = 0.10
+            circuit_hits = daily_change[daily_change >= circuit_threshold]
+
+            if len(circuit_hits) > 0:
+                max_move = daily_change.max() * 100
+                circuit_dates = circuit_hits.index.tolist()
+                reason = (
+                    f"Circuit breaker risk: {len(circuit_hits)} days with >=10% moves "
+                    f"(max: {max_move:.1f}%) on {[d.strftime('%Y-%m-%d') for d in circuit_dates[-3:]]}"
+                )
+                self.logger.log_validation(ticker, "circuit_breaker", True, reason, warning=True)
+                return True, reason
+
+            # Check for elevated volatility (avg daily move > 5%)
+            avg_move = daily_change.mean() * 100
+            if avg_move > 5:
+                reason = f"High volatility: Avg daily move {avg_move:.1f}% - near circuit risk"
+                self.logger.log_validation(ticker, "circuit_breaker", True, reason, warning=True)
+                return True, reason
+
+            self.logger.log_validation(ticker, "circuit_breaker", False)
+            return False, None
+
+        except Exception as e:
+            reason = f"Circuit breaker detection error: {str(e)}"
+            self.logger.log_validation(ticker, "circuit_breaker", False, reason)
+            return False, None
+
     def validate_all(
         self,
         ticker: str,
@@ -293,6 +408,7 @@ class MarketDataValidator:
     ) -> Dict[str, Tuple[bool, Optional[str]]]:
         """
         Run all validation checks and return results.
+        Includes Indian market specific validations for .NS/.BO tickers.
 
         Args:
             ticker: Stock ticker symbol
@@ -312,8 +428,18 @@ class MarketDataValidator:
         if current_price is not None:
             results['price_range'] = self.validate_price_range(ticker, current_price, df)
 
+        # Indian market specific validations
+        is_indian = ticker.endswith('.NS') or ticker.endswith('.BO')
+        if is_indian:
+            results['circuit_breaker'] = self.detect_circuit_breaker_risk(ticker, df)
+
         # Log overall validation result
-        all_passed = all(result[0] for key, result in results.items() if key != 'corporate_actions')
+        # Exclude warning-type checks from pass/fail (corporate_actions, circuit_breaker)
+        warning_checks = {'corporate_actions', 'circuit_breaker'}
+        all_passed = all(
+            result[0] for key, result in results.items()
+            if key not in warning_checks
+        )
         self.logger.logger.info(
             "full_validation",
             ticker=ticker,
