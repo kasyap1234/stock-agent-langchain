@@ -23,11 +23,12 @@ def load_predictions() -> List[Dict]:
     return []
 
 
-def save_prediction(ticker: str, recommendation: str, entry: float, target: float, 
-                   stop_loss: float, confidence: int, sector: str = None, regime: str = None, date: str = None):
-    """Save a new prediction to memory."""
+def save_prediction(ticker: str, recommendation: str, entry: float, target: float,
+                   stop_loss: float, confidence: int, sector: str = None, regime: str = None,
+                   date: str = None, reasoning: str = None):
+    """Save a new prediction to memory with optional reasoning."""
     predictions = load_predictions()
-    
+
     prediction = {
         "ticker": ticker,
         "date": date or datetime.now().strftime("%Y-%m-%d"),
@@ -38,12 +39,13 @@ def save_prediction(ticker: str, recommendation: str, entry: float, target: floa
         "target": target,
         "stop_loss": stop_loss,
         "confidence": confidence,
+        "reasoning": reasoning,
         "outcome": "PENDING",
         "actual_return": None
     }
-    
+
     predictions.append(prediction)
-    
+
     with open(PREDICTIONS_FILE, 'w') as f:
         json.dump(predictions, f, indent=2)
 
@@ -156,33 +158,130 @@ LEARNING:
 def get_sector_performance_history(sector: str) -> str:
     """
     Analyzes historical performance by sector.
-    
+
     Args:
-        sector: Sector name (e.g., "Technology", "Banking")
-    
+        sector: Sector name (e.g., "Technology", "Financial Services", "Healthcare")
+
     Returns:
-        Sector-specific win rate and insights
+        Sector-specific win rate, insights, and example reasoning from past wins
     """
     try:
         predictions = load_predictions()
-        
+
         if not predictions:
             return "No historical data available"
-        
-        # This is simplified - in production, you'd map tickers to sectors
-        # For now, return a generic message
+
+        # Filter by sector
+        sector_preds = [p for p in predictions if p.get("sector") == sector]
+
+        if not sector_preds:
+            return f"No historical predictions for sector: {sector}"
+
+        # Calculate sector-specific stats
+        total = len(sector_preds)
+        wins = [p for p in sector_preds if p.get("outcome") == "WIN"]
+        losses = [p for p in sector_preds if p.get("outcome") == "LOSS"]
+
+        win_rate = (len(wins) / (len(wins) + len(losses)) * 100) if (len(wins) + len(losses)) > 0 else 0
+
+        # Average return for wins
+        win_returns = [p.get("actual_return", 0) for p in wins if p.get("actual_return")]
+        avg_win_return = sum(win_returns) / len(win_returns) if win_returns else 0
+
+        # Regime breakdown
+        regime_stats = {}
+        for p in sector_preds:
+            regime = p.get("regime", "unknown")
+            if regime not in regime_stats:
+                regime_stats[regime] = {"total": 0, "wins": 0}
+            regime_stats[regime]["total"] += 1
+            if p.get("outcome") == "WIN":
+                regime_stats[regime]["wins"] += 1
+
         report = f"""
 SECTOR PERFORMANCE: {sector}
 {'='*50}
-Note: Sector tracking will improve as more predictions accumulate.
+Total Predictions: {total}
+Wins: {len(wins)} | Losses: {len(losses)}
+Win Rate: {win_rate:.1f}%
+Avg Win Return: {avg_win_return:.1f}%
 
-Current strategy:
-- Technology: Trend-following works best
-- Banking: Fundamental analysis more reliable
-- Energy: Commodity correlation is key
+PERFORMANCE BY REGIME:
+"""
+        for regime, stats in regime_stats.items():
+            regime_wr = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
+            report += f"  {regime}: {stats['wins']}/{stats['total']} ({regime_wr:.0f}% win rate)\n"
+
+        # Show reasoning from recent wins (few-shot learning context)
+        recent_wins = sorted(wins, key=lambda x: x.get("date", ""), reverse=True)[:3]
+        if recent_wins:
+            report += f"\nSUCCESSFUL REASONING EXAMPLES:\n"
+            for p in recent_wins:
+                reasoning = p.get("reasoning", "No reasoning recorded")
+                report += f"\n  {p['ticker']} ({p['date']}) - {p['recommendation']}:\n"
+                report += f"  \"{reasoning[:200]}{'...' if len(reasoning) > 200 else ''}\"\n"
+                report += f"  Result: +{p.get('actual_return', 0):.1f}%\n"
+
+        report += "\n" + "=" * 50
+        return report
+
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@tool
+def get_similar_winning_trades(sector: str, regime: str) -> str:
+    """
+    Retrieves similar winning trades for few-shot learning context.
+
+    Args:
+        sector: Stock sector (e.g., "Technology", "Financial Services")
+        regime: Market regime (e.g., "trending_up", "ranging", "volatile")
+
+    Returns:
+        Detailed examples of similar successful trades with reasoning
+    """
+    try:
+        examples = find_similar_examples(sector, regime, outcome="WIN", limit=3)
+
+        if not examples:
+            return f"No similar winning examples found for {sector} in {regime} regime."
+
+        report = f"""
+SIMILAR SUCCESSFUL TRADES
+Sector: {sector} | Regime: {regime}
 {'='*50}
 """
+        for i, ex in enumerate(examples, 1):
+            report += f"""
+EXAMPLE {i}: {ex['ticker']} ({ex['date']})
+Recommendation: {ex['recommendation']}
+Entry: Rs{ex['entry']} | Target: Rs{ex['target']} | Stop: Rs{ex['stop_loss']}
+Confidence: {ex['confidence']}%
+Result: +{ex.get('actual_return', 0):.1f}%
+
+REASONING:
+{ex.get('reasoning', 'No reasoning recorded')}
+
+KEY TAKEAWAYS:
+"""
+            # Extract key patterns from reasoning
+            reasoning = ex.get('reasoning', '').lower()
+            if 'usd-inr' in reasoning or 'rupee' in reasoning:
+                report += "- Currency movement was a factor\n"
+            if 'vix' in reasoning:
+                report += "- VIX levels influenced position sizing\n"
+            if 'breakout' in reasoning or 'breakdown' in reasoning:
+                report += "- Technical breakout/breakdown pattern\n"
+            if 'rbi' in reasoning or 'policy' in reasoning:
+                report += "- Monetary policy was considered\n"
+            if 'fii' in reasoning or 'dii' in reasoning:
+                report += "- Institutional flows were tracked\n"
+            if 'results' in reasoning or 'earnings' in reasoning:
+                report += "- Earnings timing was factored in\n"
+
+        report += "\n" + "=" * 50
         return report
-        
+
     except Exception as e:
         return f"Error: {str(e)}"
