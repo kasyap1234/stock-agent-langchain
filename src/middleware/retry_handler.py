@@ -177,3 +177,42 @@ def retry_yfinance(func: Callable) -> Callable:
             retry_on=(Exception,)  # yfinance can raise various exceptions
         )
     )(func)
+
+
+def retry_news_api(func: Callable) -> Callable:
+    """Retry for news API calls (3 attempts, handles rate limits)."""
+    return with_retry(
+        RetryConfig(
+            max_attempts=3,
+            backoff_factor=2.0,
+            initial_delay=1.0,
+            max_delay=15.0,
+            retry_on=(ConnectionError, TimeoutError, Exception)
+        )
+    )(func)
+
+
+def retry_social_media(func: Callable) -> Callable:
+    """Retry for social media scraping (3 attempts, longer delays for rate limits)."""
+    return with_retry(
+        RetryConfig(
+            max_attempts=3,
+            backoff_factor=2.5,
+            initial_delay=3.0,
+            max_delay=30.0,
+            retry_on=(ConnectionError, TimeoutError, Exception)
+        )
+    )(func)
+
+
+def retry_sentiment_model(func: Callable) -> Callable:
+    """Retry for sentiment model inference (2 attempts, fast)."""
+    return with_retry(
+        RetryConfig(
+            max_attempts=2,
+            backoff_factor=1.5,
+            initial_delay=0.5,
+            max_delay=5.0,
+            retry_on=(RuntimeError, Exception)
+        )
+    )(func)
