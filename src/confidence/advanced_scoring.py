@@ -7,12 +7,13 @@ class ConfidenceScorer:
     
     def __init__(self):
         self.weights = {
-            "signal_alignment": 0.30,
-            "data_quality": 0.15,
+            "signal_alignment": 0.25,
+            "data_quality": 0.10,
             "regime_match": 0.15,
             "backtest_robustness": 0.20,
             "monte_carlo": 0.10,
-            "volatility_penalty": 0.10
+            "volatility_penalty": 0.10,
+            "sentiment_confidence": 0.10
         }
 
     def calculate_score(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -44,7 +45,10 @@ class ConfidenceScorer:
         
         # 6. Volatility Penalty
         scores["volatility_penalty"] = self._score_volatility(analysis_data)
-        
+
+        # 7. Sentiment Confidence (NLP model confidence, article count, cross-source agreement)
+        scores["sentiment_confidence"] = self._score_sentiment_confidence(analysis_data)
+
         # Calculate Weighted Average
         final_score = 0.0
         breakdown = []

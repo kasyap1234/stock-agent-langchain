@@ -149,16 +149,78 @@ def analyze_text_sentiment(text: str) -> tuple:
 # Twitter/X Scraping (via Nitter)
 # ============================================================
 
+# Nitter instances - these are volunteer-maintained and may go down
+# The scraper will try each instance in order and fall back to the next
 NITTER_INSTANCES = [
     'https://nitter.poast.org',
     'https://nitter.privacydev.net',
     'https://nitter.net',
 ]
 
+# Cache for healthy Nitter instances
+_healthy_instances: List[str] = []
+_last_health_check: Optional[datetime] = None
+HEALTH_CHECK_INTERVAL = timedelta(minutes=30)
+
+
+def _check_nitter_health(instance: str, timeout: int = 5) -> bool:
+    """
+    Check if a Nitter instance is healthy with a lightweight request.
+
+    Args:
+        instance: Nitter instance URL
+        timeout: Request timeout in seconds
+
+    Returns:
+        True if instance responds successfully
+    """
+    import requests
+    try:
+        response = requests.head(instance, timeout=timeout, allow_redirects=True)
+        return response.status_code < 400
+    except Exception:
+        return False
+
+
+def _get_healthy_nitter_instances() -> List[str]:
+    """
+    Get list of healthy Nitter instances, with caching.
+
+    Performs health checks periodically and caches results.
+    Falls back to all instances if none are healthy.
+    """
+    global _healthy_instances, _last_health_check
+
+    now = datetime.now()
+
+    # Return cached healthy instances if still valid
+    if _last_health_check and (now - _last_health_check) < HEALTH_CHECK_INTERVAL:
+        if _healthy_instances:
+            return _healthy_instances
+
+    # Perform health checks
+    healthy = []
+    for instance in NITTER_INSTANCES:
+        if _check_nitter_health(instance):
+            healthy.append(instance)
+
+    _last_health_check = now
+    _healthy_instances = healthy
+
+    # Fall back to all instances if none are healthy
+    if not healthy:
+        logger.logger.warning("no_healthy_nitter_instances",
+                             message="All Nitter instances appear down, trying all")
+        return NITTER_INSTANCES
+
+    return healthy
+
 
 def _scrape_twitter_nitter(query: str, limit: int = 20) -> List[Dict]:
     """
     Scrape Twitter via Nitter instances (free, no API needed).
+
+    Uses health-checked instances with automatic fallback.
 
     Args:
         query: Search query
@@ -171,8 +233,9 @@ def _scrape_twitter_nitter(query: str, limit: int = 20) -> List[Dict]:
     from bs4 import BeautifulSoup
 
     tweets = []
+    instances = _get_healthy_nitter_instances()
 
-    for instance in NITTER_INSTANCES:
+    for instance in instances:
         try:
             if not twitter_limiter.acquire(blocking=True, timeout=30):
                 continue
@@ -238,16 +301,19 @@ def _scrape_twitter_nitter(query: str, limit: int = 20) -> List[Dict]:
     return tweets
 
 
-def fetch_twitter_sentiment(ticker: str, days_back: int = 3) -> List[SocialMention]:
+def fetch_twitter_sentiment(ticker: str) -> List[SocialMention]:
     """
     Fetch Twitter mentions for a stock.
 
     Args:
         ticker: Stock ticker
-        days_back: Days to look back
 
     Returns:
         List of SocialMention objects
+
+    Note:
+        Tweet timestamps are approximate (scraping limitation).
+        Date filtering is not available with Nitter scraping.
     """
     search_terms = get_search_terms(ticker)
     all_mentions = []
@@ -354,8 +420,6 @@ def fetch_reddit_sentiment(
                     query = f"{term}"
 
                     for post in subreddit.search(query, time_filter='week', limit=limit):
-                        reddit_limiter.acquire(blocking=True, timeout=10)
-
                         # Combine title and body
                         text = f"{post.title} {post.selftext or ''}"
                         score, label = analyze_text_sentiment(text)
@@ -499,7 +563,7 @@ def get_twitter_sentiment(ticker: str) -> str:
         return cached_result
 
     try:
-        mentions = fetch_twitter_sentiment(ticker, days_back=3)
+        mentions = fetch_twitter_sentiment(ticker)
         result = aggregate_social_sentiment(mentions, source='twitter')
         result.ticker = ticker
 
@@ -714,7 +778,7 @@ def get_social_sentiment_aggregate(ticker: str) -> str:
         reddit_mentions = []
 
         try:
-            twitter_mentions = fetch_twitter_sentiment(ticker, days_back=3)
+            twitter_mentions = fetch_twitter_sentiment(ticker)
         except Exception as e:
             logger.log_fetch(ticker, "social_agg_twitter", False, 0, 0, str(e))
 

@@ -597,12 +597,18 @@ Try a different search query or check if the ticker is correct.
 {'='*50}
 """
 
-        # Step 3: Score each article
-        scores = batch_score_texts(articles, prefer_finbert=True)
+        # Step 3: Score each article with full text tracking
+        scored_articles = []
+        for article in articles:
+            score = score_text_hybrid(article, prefer_finbert=True)
+            if score:
+                scored_articles.append((score, article))
 
-        # Step 4: Apply sector adjustments
+        # Step 4: Apply sector adjustments with full text (not truncated)
         if sector:
-            scores = [apply_sector_boost(s, sector, s.text) for s in scores]
+            scores = [apply_sector_boost(s, sector, full_text) for s, full_text in scored_articles]
+        else:
+            scores = [s for s, _ in scored_articles]
 
         # Step 5: Aggregate
         aggregated = aggregate_sentiments(scores)

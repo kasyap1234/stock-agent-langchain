@@ -2,6 +2,7 @@
 Optimized supervisor with enhanced synthesis.
 """
 from typing import TypedDict, Annotated, List, Dict
+from typing_extensions import NotRequired
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_groq import ChatGroq
 import operator
@@ -14,10 +15,10 @@ class AgentState(TypedDict):
     sector: str
     regime: str
     analysis_results: Dict[str, str]
-    # Quantitative sentiment data from NLP analysis
-    sentiment_score: float  # -1 (bearish) to +1 (bullish)
-    sentiment_confidence: float  # 0 to 1
-    articles_analyzed: int  # Number of articles analyzed for sentiment
+    # Quantitative sentiment data from NLP analysis (optional - may not always be populated)
+    sentiment_score: NotRequired[float]  # -1 (bearish) to +1 (bullish)
+    sentiment_confidence: NotRequired[float]  # 0 to 1
+    articles_analyzed: NotRequired[int]  # Number of articles analyzed for sentiment
 
 # Initialize LLM
 llm = ChatGroq(model="moonshotai/kimi-k2-instruct-0905", temperature=0, max_retries=5)
