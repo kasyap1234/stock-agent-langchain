@@ -61,23 +61,86 @@ class ConfidenceScorer:
         }
 
     def _score_alignment(self, data: Dict[str, Any]) -> float:
-        # Simple agreement check
+        """
+        Score alignment using quantitative sentiment when available.
+
+        Enhanced to use numeric sentiment_score from NLP analysis.
+        """
         signals = []
+
+        # Technical signal
         if "technical_analysis" in data:
-            signals.append(1 if "bullish" in data["technical_analysis"].lower() else -1 if "bearish" in data["technical_analysis"].lower() else 0)
+            tech = data["technical_analysis"].lower()
+            signals.append(1 if "bullish" in tech else -1 if "bearish" in tech else 0)
+
+        # Fundamental signal
         if "fundamental_analysis" in data:
-            signals.append(1 if "positive" in data["fundamental_analysis"].lower() else -1 if "negative" in data["fundamental_analysis"].lower() else 0)
-        if "sentiment_analysis" in data:
-            signals.append(1 if "positive" in data["sentiment_analysis"].lower() else -1 if "negative" in data["sentiment_analysis"].lower() else 0)
-            
-        if not signals: return 50.0
-        
+            fund = data["fundamental_analysis"].lower()
+            signals.append(1 if "positive" in fund else -1 if "negative" in fund else 0)
+
+        # NEW: Use quantitative sentiment score if available (-1 to +1)
+        if "sentiment_score" in data:
+            # Direct numeric score from NLP analysis
+            nlp_score = data["sentiment_score"]
+            signals.append(nlp_score)  # Already in -1 to +1 range
+        elif "sentiment_analysis" in data:
+            # Fallback to text parsing
+            sent = data["sentiment_analysis"].lower()
+            signals.append(1 if "positive" in sent or "bullish" in sent
+                          else -1 if "negative" in sent or "bearish" in sent
+                          else 0)
+
+        if not signals:
+            return 50.0
+
+        # Calculate agreement based on average signal direction and magnitude
         avg_signal = sum(signals) / len(signals)
-        # Map -1 to 1 range to 0 to 100 score
-        # 1 -> 100, 0 -> 50, -1 -> 0 (but we care about magnitude of agreement for confidence)
-        # Actually, if all agree (3 or -3), confidence is high. If mixed (0), confidence is low.
-        agreement = abs(sum(signals)) # 0 to 3
-        return (agreement / 3) * 100
+
+        # Check if all signals agree on direction
+        all_positive = all(s > 0 for s in signals)
+        all_negative = all(s < 0 for s in signals)
+
+        if all_positive or all_negative:
+            # Full agreement - high confidence scaled by magnitude
+            agreement_score = abs(avg_signal) * 100
+        else:
+            # Mixed signals - lower confidence
+            agreement_score = 30 + abs(avg_signal) * 20
+
+        return min(100, max(0, agreement_score))
+
+    def _score_sentiment_confidence(self, data: Dict[str, Any]) -> float:
+        """
+        Score confidence in sentiment analysis specifically.
+
+        Factors:
+        - NLP model confidence
+        - Number of articles analyzed
+        - Agreement between NLP and options sentiment
+        """
+        base_score = 50.0
+
+        # NLP model confidence (0 to 1)
+        if "sentiment_confidence" in data:
+            base_score = data["sentiment_confidence"] * 100
+
+        # Article count bonus (more articles = higher confidence)
+        if "articles_analyzed" in data:
+            article_boost = min(data["articles_analyzed"] * 3, 20)
+            base_score += article_boost
+
+        # Agreement between NLP and options sentiment
+        if "options_sentiment" in data and "sentiment_score" in data:
+            options = 1 if "bullish" in str(data["options_sentiment"]).lower() else \
+                     -1 if "bearish" in str(data["options_sentiment"]).lower() else 0
+            news = data["sentiment_score"]
+
+            if (options > 0 and news > 0) or (options < 0 and news < 0):
+                base_score += 10  # Agreement bonus
+            elif options != 0 and news != 0 and options * news < 0:
+                base_score -= 10  # Disagreement penalty
+
+        return min(100, max(0, base_score))
 
     def _score_data_quality(self, data: Dict[str, Any]) -> float:
         # Placeholder: Assume 100 unless flagged

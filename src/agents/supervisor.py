@@ -14,6 +14,10 @@ class AgentState(TypedDict):
     sector: str
     regime: str
     analysis_results: Dict[str, str]
+    # Quantitative sentiment data from NLP analysis
+    sentiment_score: float  # -1 (bearish) to +1 (bullish)
+    sentiment_confidence: float  # 0 to 1
+    articles_analyzed: int  # Number of articles analyzed for sentiment
 
 # Initialize LLM
 llm = ChatGroq(model="moonshotai/kimi-k2-instruct-0905", temperature=0, max_retries=5)
